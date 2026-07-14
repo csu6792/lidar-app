@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RPLIDAR-A1M8 網頁版極致流暢點雲圖</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background-color: #121212;
+            color: #e0e0e0;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        h2 {
+            margin-top: 0;
+            color: #00ff00;
+        }
+        .controls {
+            margin-bottom: 15px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        button {
+            background-color: #1e1e1e;
+            color: #00ff00;
+            border: 1px solid #00ff00;
+            padding: 10px 20px;
+            font-size: 14px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.3s;
+        }
+        button:hover {
+            background-color: #00ff00;
+            color: #121212;
+            box-shadow: 0 0 10px #00ff00;
+        }
+        button:disabled {
+            border-color: #555;
+            color: #555;
+            cursor: not-allowed;
+            box-shadow: none;
+            background-color: #121212;
+        }
+        #status {
+            font-weight: bold;
+            color: #ff9800;
+        }
+        canvas {
+            background-color: #0f0f0f;
+            border: 2px solid #333;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+            border-radius: 8px;
+        }
+        .tip {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+
+    <h2>RPLIDAR-A1M8 網頁版極致流暢點雲圖</h2>
+    
+    <div class="controls">
+        <button id="btnConnect">連線雷達 (Connect)</button>
+        <button id="btnDisconnect" disabled>斷開連線 (Disconnect)</button>
+        <button id="btnMotor">切換馬達控制線 (DTR)</button>
+        <span>狀態: <span id="status">未連線</span></span>
+    </div>
+
+    <canvas id="lidarCanvas" width="700" height="700"></canvas>
+    
+    <div class="tip">💡 提示：本網頁採用 Web Serial API，請使用 Chrome 或 Edge 瀏覽器開啟。雷達預設鮑率為 115200。</div>
+
+    <script>
+        // ================= 參數設定 =================
+        const D_MAX = 4000; // 最大量測距離 (mm)
+        // ============================================
+
+        const canvas = document.getElementById('lidarCanvas');
+        const ctx = canvas.getContext('2d');
+        const WIDTH = canvas.width;
+        const HEIGHT = canvas.height;
+        const CENTER_X = WIDTH / 2;
+        const CENTER_Y = HEIGHT / 2;
+        const SCALE = (Math.min(WIDTH, HEIGHT) / 2 - 20) / D_MAX;
+
+        // 💡 【優化】預先計算 0~359 度的三角函數查表 (LUT)
+        const SIN_TABLE = new Float32Array(360);
+        const COS_TABLE = new Float32Array(360);
+        for (let i = 0; i < 360; i++) {
+            const rad = (i * Math.PI) / 180;
+            SIN_TABLE[i] = Math.sin(rad);
+            COS_TABLE[i] = Math.cos(rad);
+        }
+
+        // 雷達資料陣列
+        let lidarData = new Array(360).fill(null);
+        
+        // Web Serial 相關變數
+        let port = null;
+        let reader = null;
+        let isRunning = false;
+        let dtrState = false; // 馬達控制線狀態
+
+        // UI 元件
+        const btnConnect = document.getElementById('btnConnect');
+        const btnDisconnect = document.getElementById('btnDisconnect');
+        const btnMotor = document.getElementById('btnMotor');
+        const statusText = document.getElementById('status');
+
+        // 監聽按鈕事件
+        btnConnect.addEventListener('click', startLidar);
+        btnDisconnect.addEventListener('click', stopLidar);
+        btnMotor.addEventListener('click', toggleMotor);
+
+        /**
+         * 啟動雷達與序列埠讀取
+         */
+        async function startLidar() {
+            if (!("serial" in navigator)) {
+                alert("❌ 您的瀏覽器不支援 Web Serial API，請更換為 Chrome 或 Edge 瀏覽器！");
+                return;
+            }
+
+            try {
+                // 1. 請求使用者選擇 COM Port
+                port = await navigator.serial.requestPort();
+                
+                // 2. 開啟序列埠 (RPLIDAR A1M8 預設鮑率為 115200)
+                await port.open({ baudRate: 115200 });
+                statusText.innerText = "已連線，正在啟動馬達與掃描...";
+                statusText.style.color = "#00ff00";
+
+                btnConnect.disabled = true;
+                btnDisconnect.disabled = false;
+
+                // 3. 控制 DTR 訊號讓馬達旋轉 (部分轉接板需要)
+                await port.setSignals({ dataTerminalReady: dtrState, requestToSend: false });
+
+                // 4. 發送啟動掃描指令 (RPLIDAR 協定: 0xA5 0x20 為開始掃描)
+                const writer = port.writable.getWriter();
+                const startCmd = new Uint8Array([0xA5, 0x20]);
+                await writer.write(startCmd);
+                writer.releaseLock();
+
+                // 5. 進入讀取無窮迴圈
+                isRunning = true;
+                readLoop();
+
+            } catch (error) {
+                console.error(error);
+                statusText.innerText = "連線失敗: " + error.message;
+                statusText.style.color = "#ff0000";
+                stopLidar();
+            }
+        }
+
+        /**
+         * 序列埠資料解析核心（高效位元組流處理）
+         */
+        async function readLoop() {
+            let buffer = [];
+            
+            try {
+                while (isRunning && port.readable) {
+                    reader = port.readable.getReader();
+                    
+                    while (true) {
+                        const { value, done } = await reader.read();
+                        if (done) break;
+                        
+                        // 將新收到的 Uint8Array 放入快取陣列
+                        for (let i = 0; i < value.length; i++) {
+                            buffer.push(value[i]);
+                        }
+
+                        // RPLIDAR 標準掃描協定：一個點佔用 5 個位元組
+                        while (buffer.length >= 5) {
+                            const b0 = buffer[0];
+                            const b1 = buffer[1];
+
+                            // 檢查位元組對齊防錯機制 (S 與 !S 互補，且 checkBit 必須為 1)
+                            const sBit = b0 & 0x01;
+                            const sBitInv = (b0 >> 1) & 0x01;
+                            const checkBit = b1 & 0x01;
+
+                            if (sBit !== sBitInv && checkBit === 1) {
+                                // 驗證成功，開始解包資料
+                                const quality = b0 >> 2;
+                                // 角度精確計算
+                                const angle = ((b1 | (buffer[2] << 8)) >> 1) / 64.0;
+                                // 距離精確計算 (mm)
+                                const distance = (buffer[3] | (buffer[4] << 8)) / 4.0;
+
+                                if (distance > 0) {
+                                    const angIdx = Math.round(angle) % 360;
+                                    lidarData[angIdx] = { distance, quality };
+                                }
+                                // 移除已處理的 5 個位元組
+                                buffer.splice(0, 5);
+                            } else {
+                                // 對齊失敗，跳過 1 個位元組繼續尋找同步點
+                                buffer.shift();
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                console.error("讀取中斷:", error);
+            } finally {
+                if (reader) {
+                    reader.releaseLock();
+                }
+            }
+        }
+
+        /**
+         * 斷開連線與重置雷達
+         */
+        async function stopLidar() {
+            isRunning = false;
+            
+            if (reader) {
+                try { await reader.cancel(); } catch(e) {}
+            }
+
+            if (port) {
+                try {
+                    // 發送停止掃描指令 (0xA5 0x25)
+                    const writer = port.writable.getWriter();
+                    await writer.write(new Uint8Array([0xA5, 0x25]));
+                    writer.releaseLock();
+                    
+                    // 關閉馬達
+                    await port.setSignals({ dataTerminalReady: !dtrState });
+                    await port.close();
+                } catch (e) {
+                    console.error("關閉 Port 時發生異常:", e);
+                }
+                port = null;
+            }
+
+            statusText.innerText = "已斷開連線";
+            statusText.style.color = "#ff9800";
+            btnConnect.disabled = false;
+            btnDisconnect.disabled = true;
+            lidarData.fill(null); // 清空畫布資料
+        }
+
+        /**
+         * 手動切換 DTR 控制線 (用來控制部分轉接板的馬達啟停)
+         */
+        async function toggleMotor() {
+            dtrState = !dtrState;
+            if (port && isRunning) {
+                await port.setSignals({ dataTerminalReady: dtrState });
+                statusText.innerText = `馬達 DTR 已切換為: ${dtrState}`;
+            } else {
+                alert(`馬達預設狀態已調整為: ${dtrState} (請連線後觀察馬達是否旋轉)`);
+            }
+        }
+
+        /**
+         * 背景網格與雷達中心繪製
+         */
+        function drawGrid() {
+            ctx.strokeStyle = '#282828';
+            ctx.lineWidth = 1;
+            
+            // 繪製距離同心圓
+            const rings = [1000, 2000, 3000, 4000];
+            rings.forEach(r => {
+                if (r <= D_MAX) {
+                    ctx.beginPath();
+                    ctx.arc(CENTER_X, CENTER_Y, r * SCALE, 0, 2 * Math.PI);
+                    ctx.stroke();
+                }
+            });
+
+            // 繪製十字正交線
+            ctx.beginPath();
+            ctx.moveTo(0, CENTER_Y); ctx.lineTo(WIDTH, CENTER_Y);
+            ctx.moveTo(CENTER_X, 0); ctx.lineTo(CENTER_X, HEIGHT);
+            ctx.stroke();
+
+            // 中心點
+            ctx.fillStyle = '#00ff00';
+            ctx.beginPath();
+            ctx.arc(CENTER_X, CENTER_Y, 5, 0, 2 * Math.PI);
+            ctx.fill();
+        }
+
+        /**
+         * 動畫渲染迴圈 (利用 requestAnimationFrame 達到極致流暢度)
+         */
+        function renderLoop() {
+            // 1. 清空畫布
+            ctx.fillStyle = '#151515';
+            ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+            // 2. 畫背景網格
+            drawGrid();
+
+            // 3. 繪製 360 度點雲
+            for (let i = 0; i < 360; i++) {
+                const point = lidarData[i];
+                if (!point || point.distance === 0) continue;
+
+                const dist = point.distance;
+                
+                // 💡 【優化】直接查表，省去網頁重複計算 Math.sin / Math.cos 的效能損耗
+                // 0度朝上，順時針旋轉
+                const x = CENTER_X + dist * SCALE * SIN_TABLE[i];
+                const y = CENTER_Y - dist * SCALE * COS_TABLE[i];
+
+                if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+                    // 動態色彩漸層
+                    let ratio = dist / D_MAX;
+                    if (ratio > 1.0) ratio = 1.0;
+                    
+                    const colorR = Math.floor(255 * (1.0 - ratio));
+                    const colorG = Math.floor(255 * ratio);
+
+                    ctx.fillStyle = `rgb(${colorR}, ${colorG}, 220)`;
+                    ctx.beginPath();
+                    ctx.arc(x, y, 2.5, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+            }
+
+            requestAnimationFrame(renderLoop);
+        }
+
+        // 啟動瀏覽器自帶的渲染畫布迴圈
+        renderLoop();
+    </script>
+</body>
+</html>
